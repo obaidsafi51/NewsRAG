@@ -1,56 +1,118 @@
 import streamlit as st
-from openai import OpenAI
+import asyncio
+from newsapi import NewsApiClient
+import aiohttp
+from datetime import date, timedelta
+import requests
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+# --- API Keys and Access Tokens ---
+newsapi_key = "446dc1fa183e4e859a7fb0daf64a6f2c"  # Replace with your actual News API key
+gorq_api_key = "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"  # Replace with your actual Gorq API key
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+# Initialize News API client
+newsapi = NewsApiClient(api_key=newsapi_key)
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+# Function to fetch news using News API asynchronously
+async def fetch_news(topic, sources=None, domains=None):
+    # Calculate today's date
+    today = date.today()
+    yesterday = today - timedelta(days=1)
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    url = "https://newsapi.org/v2/everything"
+    params = {
+        "q": topic or "",
+        "sources": sources or "",
+        "domains": domains or "",
+        "language": "en",
+        "sortBy": "relevancy",
+        "pageSize": 100,
+        "apiKey": newsapi_key,
+        "from": yesterday.isoformat(),
+        "to": today.isoformat()
+    }
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, params=params, timeout=10) as response:  # Add timeout
+                data = await response.json()
+                return data["articles"]
+        except asyncio.TimeoutError:
+            print("Timeout occurred while fetching news.")
+            return None  # Or handle the timeout in another way
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
+# Function to summarize news using Gorq API with LLaMA 3
+def summarize_news(text):
+    headers = {
+        "Authorization": f"Bearer {gorq_api_key}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "text": text,
+        "length": "short",
+        "model": "llama2-70b-chat"  # Use LLaMA 2 70B chat model
+    }
+    try:
+        response = requests.post("https://api.gorq.io/summarize", headers=headers, json=data, timeout=10)  # Add timeout
+        if response.status_code == 200:
+            return response.json()["summary"]
+        else:
+            print(f"Error summarizing: {response.status_code} - {response.text}")
+            return "Error summarizing the text."
+    except requests.exceptions.RequestException as e:
+        print(f"An error occurred during summarization: {e}")
+        return "Error summarizing the text."
+
+# --- Streamlit app ---
+st.title("📰 News Retriever & Summarizer")
+st.write("Retrieve, summarize, and display news articles!")
+
+# --- Session state initialization ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+    st.session_state.news_data = None
+
+# --- Display chat messages ---
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# --- Get initial news topic ---
+if st.session_state.news_data is None:
+    if topic := st.chat_input("Enter your news topic:"):
+        st.session_state.messages.append({"role": "user", "content": topic})
         with st.chat_message("user"):
-            st.markdown(prompt)
+            st.markdown(topic)
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
-
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
         with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+            st.markdown("Fetching news...")
+
+        # Fetch news articles asynchronously
+        async def fetch_and_display_news():
+            try:
+                st.session_state.news_data = await fetch_news(topic)
+
+                if st.session_state.news_data:
+                    st.markdown("News retrieved!")
+                else:
+                    st.markdown("No news found for this topic.")
+            except Exception as e:
+                st.markdown(f"An error occurred: {type(e).__name__}: {e}")
+                st.exception(e)
+
+        asyncio.run(fetch_and_display_news())
+
+# --- Display news data with summaries if available ---
+if st.session_state.news_data:
+    if st.button("Show News with Summaries"):
+        with st.chat_message("assistant"):
+            # Display all news articles with summaries
+            for article in st.session_state.news_data:
+                st.markdown(f"**{article['title']}**")
+                summary = summarize_news(article.get('content', ''))
+                st.markdown(f"**Summary:** {summary}")
+                st.markdown(article['url'])
+                st.markdown("---")
+
+        # Clear news data after displaying
+        st.session_state.news_data = None
